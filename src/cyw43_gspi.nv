@@ -1,0 +1,314 @@
+// cyw43_gspi: the CYW43439's gSPI bus: its command words, its register
+// reads and writes, and its backplane, over embedded-hal-nv's SpiBus
+// with a GPIO pin as the chip select.
+//
+// The gSPI is a half-duplex SPI: one data line, which the host drives
+// for a command word and the data it writes and releases for the data
+// it reads (CYW43439 datasheet, "gSPI interface").  Each transaction
+// starts with a 32-bit command word: bit 31 set for a write, bit 30 for
+// an incrementing address, bits 28 and 29 the function (0 the bus's own
+// registers, 1 the backplane, 2 the WLAN frames), bits 11 to 27 the
+// address and bits 0 to 10 the length in bytes.  A word goes out most
+// significant bit first.  A byte this driver reads it clocks with
+// `transfer(-1)`: a three-wire controller releases the data line for
+// it, as orbit/bsp/raspberrypi/blocks/rp_pio_spi3.nv does, and a
+// four-wire one clocks out 0xFF.
+//
+// Out of power-on the chip takes 16-bit words, so the first commands
+// have their two halves swapped; the driver then sets 32-bit words,
+// little-endian, which the rest of the bring-up uses.  The bus also
+// appends a 32-bit status word to every transaction once STATUS_ENABLE
+// is set; the driver reads it after each one, before it raises the chip
+// select, and keeps it.
+//
+// The backplane is the chip's internal 32-bit address space, reached
+// through function 1 in a 32 KB window whose base the three registers
+// at 0x1000A to 0x1000C hold.  A read on function 1 is preceded by a
+// pad word, the response delay the bring-up sets
+// (SPI_RESP_DELAY_F1 = 4).  A data word of a backplane or WLAN transfer
+// holds four bytes little-endian, so the first byte of a group of four
+// goes out last.
+//
+// The order and the constants are those of Embassy's `cyw43` crate
+// (`cyw43/src/spi.rs`, `consts.rs`; MIT/Apache), which follows
+// Infineon's WHD and the pico-sdk's cyw43-driver; nothing was ported.
+// What it fixes and this driver keeps is named where it is kept.
+//
+// The driver is for one chip in a program: the backplane window, the
+// last status and the bytes of a word being assembled are module state.
+
+use embedded_hal.{ BoardSpi, BoardGpio, SpiBus, GpioOut }
+
+// The functions.
+let FUNC_BUS = 0
+let FUNC_BACKPLANE = 1
+let FUNC_WLAN = 2
+
+// The bus's registers, on function 0.
+let REG_BUS_CTRL = 0x0
+let REG_BUS_INTERRUPT = 0x04
+let REG_BUS_INTERRUPT_ENABLE = 0x06
+let REG_BUS_STATUS = 0x08
+let REG_BUS_TEST_RO = 0x14
+let REG_BUS_TEST_RW = 0x18
+let REG_BUS_RESP_DELAY_F1 = 0x1D
+
+// The backplane's registers, on function 1.
+let REG_BP_FUNCTION2_WATERMARK = 0x10008
+let REG_BP_ADDRESS_LOW = 0x1000A
+let REG_BP_ADDRESS_MID = 0x1000B
+let REG_BP_ADDRESS_HIGH = 0x1000C
+let REG_BP_CHIP_CLOCK_CSR = 0x1000E
+let REG_BP_PULL_UP = 0x1000F
+
+// The window: 32 KB, an address's low 15 bits; bit 15 of a function-1
+// address asks for a 32-bit access.  A transfer moves at most 64 bytes.
+let WINDOW_MASK = 0x7FFF
+let WINDOW_SIZE = 0x8000
+let ADDR_32BIT = 0x8000
+let MAX_TRANSFER = 64
+
+// What READ_TEST_RO answers on a working bus.
+let FEEDBEAD = 0xFEEDBEAD
+
+// The backplane window last written, -1 when unknown (after power-on),
+// so the first access writes all three bytes of it; the last status
+// word; and the bytes of the data word being written and how many.
+var window = -1
+var status = 0
+var out_word = 0
+var out_count = 0
+// The data word being read and how many of its bytes are left.
+var in_word = 0
+var in_left = 0
+// How many data bytes the current read still holds, and how many words.
+var in_words = 0
+
+// A command word.
+@no_alloc
+pub fn cmd_word(write: Bool, func: Int, addr: Int, len: Int) -> Int
+    let w = if write then 0x80000000 else 0
+    w | 0x40000000 | int.shl(func & 3, 28) | int.shl(addr & 0x1FFFF, 11) | (len & 0x7FF)
+
+// A word with its two 16-bit halves swapped, as the bus takes and answers
+// them before it is set to 32-bit words.
+@no_alloc
+pub fn swap16(x: Int) -> Int
+    (int.shl(x & 0xFFFF, 16) | int.shr_logical(x, 16)) & 0xFFFFFFFF
+
+// The gSPI on a board: its SPI bus, the board's GPIO and the chip-select
+// pin, active low.
+pub @value
+struct Gspi
+    bus: BoardSpi
+    pins: BoardGpio
+    cs: Int
+
+impl Gspi
+    // Forgets the backplane window and the status, as a power cycle of
+    // the chip does.
+    fn forget(self) [mutate]
+        window = -1
+        status = 0
+
+    fn select(self) [hw]
+        self.pins.set(self.cs, 0)
+
+    // Reads the status word, then raises the chip select.
+    fn end(self) [hw, mutate]
+        status = self.recv_word()
+        self.pins.set(self.cs, 1)
+
+    // One word, most significant byte first.
+    fn send_word(self, w: Int) [hw]
+        let _a = self.bus.transfer(int.shr_logical(w, 24) & 0xFF)
+        let _b = self.bus.transfer(int.shr_logical(w, 16) & 0xFF)
+        let _c = self.bus.transfer(int.shr_logical(w, 8) & 0xFF)
+        let _d = self.bus.transfer(w & 0xFF)
+
+    // One word read, the first byte the most significant.
+    fn recv_word(self) -> Int [hw]
+        let a = self.bus.transfer(-1)
+        let b = self.bus.transfer(-1)
+        let c = self.bus.transfer(-1)
+        let d = self.bus.transfer(-1)
+        int.shl(a & 0xFF, 24) | int.shl(b & 0xFF, 16) | int.shl(c & 0xFF, 8) | (d & 0xFF)
+
+    // ── Before 32-bit words ─────────────────────────────────────────
+
+    // A 32-bit register of `func` read with the halves swapped.
+    fn read32_swapped(self, func: Int, addr: Int) -> Int [hw, mutate]
+        self.select()
+        self.send_word(swap16(cmd_word(false, func, addr, 4)))
+        let v = swap16(self.recv_word())
+        self.end()
+        v
+
+    // A 32-bit register of `func` written with the halves swapped.
+    fn write32_swapped(self, func: Int, addr: Int, val: Int) [hw, mutate]
+        self.select()
+        self.send_word(swap16(cmd_word(true, func, addr, 4)))
+        self.send_word(swap16(val))
+        self.end()
+
+    // ── Registers ───────────────────────────────────────────────────
+
+    // A register of `len` bytes (1, 2 or 4) of `func`.  A backplane read
+    // is preceded by the response delay's pad word.
+    fn read(self, func: Int, addr: Int, len: Int) -> Int [hw, mutate]
+        self.select()
+        self.send_word(cmd_word(false, func, addr, len))
+        if func == FUNC_BACKPLANE
+            let _pad = self.recv_word()
+        let v = self.recv_word()
+        self.end()
+        if len == 1
+            return v & 0xFF
+        if len == 2
+            return v & 0xFFFF
+        v
+
+    fn write(self, func: Int, addr: Int, val: Int, len: Int) [hw, mutate]
+        self.select()
+        self.send_word(cmd_word(true, func, addr, len))
+        self.send_word(val)
+        self.end()
+
+    // ── The backplane ───────────────────────────────────────────────
+
+    // Points the window at the 32 KB holding `addr`, writing only the
+    // bytes of the base that change.
+    fn set_window(self, addr: Int) [hw, mutate]
+        let base = addr & 0xFFFF8000
+        let old = window
+        if old < 0 or (int.shr_logical(base, 24) & 0xFF) != (int.shr_logical(old, 24) & 0xFF)
+            self.write(FUNC_BACKPLANE, REG_BP_ADDRESS_HIGH, int.shr_logical(base, 24) & 0xFF, 1)
+        if old < 0 or (int.shr_logical(base, 16) & 0xFF) != (int.shr_logical(old, 16) & 0xFF)
+            self.write(FUNC_BACKPLANE, REG_BP_ADDRESS_MID, int.shr_logical(base, 16) & 0xFF, 1)
+        if old < 0 or (int.shr_logical(base, 8) & 0xFF) != (int.shr_logical(old, 8) & 0xFF)
+            self.write(FUNC_BACKPLANE, REG_BP_ADDRESS_LOW, int.shr_logical(base, 8) & 0xFF, 1)
+        window = base
+
+    // A backplane register of `len` bytes; a 4-byte access sets the
+    // address's 32-bit flag.
+    fn bp_read(self, addr: Int, len: Int) -> Int [hw, mutate]
+        self.set_window(addr)
+        let flag = if len == 4 then ADDR_32BIT else 0
+        self.read(FUNC_BACKPLANE, (addr & WINDOW_MASK) | flag, len)
+
+    fn bp_write(self, addr: Int, val: Int, len: Int) [hw, mutate]
+        self.set_window(addr)
+        let flag = if len == 4 then ADDR_32BIT else 0
+        self.write(FUNC_BACKPLANE, (addr & WINDOW_MASK) | flag, val, len)
+
+    // ── Data bytes ──────────────────────────────────────────────────
+
+    // Starts a write transaction of `len` data bytes to `func` at
+    // `addr`; the caller sends them with `put`, then `put_end`.
+    fn put_begin(self, func: Int, addr: Int, len: Int) [hw, mutate]
+        self.select()
+        self.send_word(cmd_word(true, func, addr, len))
+        out_word = 0
+        out_count = 0
+
+    // One data byte; every fourth sends the word they make.
+    fn put(self, b: Int) [hw, mutate]
+        out_word = out_word | int.shl(b & 0xFF, int.shl(out_count, 3))
+        out_count = out_count + 1
+        if out_count == 4
+            self.send_word(out_word)
+            out_word = 0
+            out_count = 0
+
+    // Sends a part word padded with zeros, then ends the transaction.
+    fn put_end(self) [hw, mutate]
+        if out_count > 0
+            self.send_word(out_word)
+            out_word = 0
+            out_count = 0
+        self.end()
+
+    // Starts a read transaction of `len` data bytes from `func` at
+    // `addr`, the backplane's pad word skipped; the caller takes them
+    // with `take`, then `take_end`.
+    fn take_begin(self, func: Int, addr: Int, len: Int) [hw, mutate]
+        self.select()
+        self.send_word(cmd_word(false, func, addr, len))
+        if func == FUNC_BACKPLANE
+            let _pad = self.recv_word()
+        in_words = (len + 3) / 4
+        in_left = 0
+
+    // The next data byte, or 0 past the transaction's words.
+    fn take(self) -> Int [hw, mutate]
+        if in_left == 0
+            if in_words == 0
+                // cov: skip — no caller takes more bytes than its transaction asked for; the guard keeps a mistaken one from clocking words the chip did not send
+                return 0
+            in_word = self.recv_word()
+            in_words = in_words - 1
+            in_left = 4
+        let b = in_word & 0xFF
+        in_word = int.shr_logical(in_word, 8)
+        in_left = in_left - 1
+        b
+
+    // Reads the words the caller did not take, then ends the
+    // transaction.
+    fn take_end(self) [hw, mutate]
+        for _i in 0..in_words
+            let _w = self.recv_word()
+        in_words = 0
+        in_left = 0
+        self.end()
+
+    // The length of the next transfer at backplane address `addr` with
+    // `left` bytes to go: at most 64 bytes, and none past the end of the
+    // window, so a transfer never needs the window moved inside it.
+    fn chunk(self, addr: Int, left: Int) -> Int
+        let room = WINDOW_SIZE - (addr & WINDOW_MASK)
+        var n = left
+        if n > MAX_TRANSFER
+            n = MAX_TRANSFER
+        if n > room
+            // cov: skip — runs for a transfer across a 32 KB window; the firmware starts at a window's base and the NVRAM ends below one
+            n = room
+        n
+
+    // Writes `n` bytes of `src` from offset 0 to backplane address
+    // `addr`, which is a multiple of 4 (the chip aligns an access of 4
+    // bytes or more down to one, as Embassy's `bp_write` notes).  With
+    // `text` set, `src` is an NVRAM text file: each newline goes as the
+    // NUL that ends a variable, and bytes past its end as NULs, which end
+    // the variable list.
+    fn bp_write_str(self, addr: Int, src: Str, n: Int, text: Bool) [hw, mutate]
+        var at = addr
+        var off = 0
+        // A chunk is 64 bytes but where the window ends, which cuts one
+        // more chunk per 32 KB at most.
+        for _k in 0..(n / MAX_TRANSFER + n / WINDOW_SIZE + 2)
+            if off < n
+                let len = self.chunk(at, n - off)
+                self.set_window(at)
+                self.put_begin(FUNC_BACKPLANE, (at & WINDOW_MASK) | ADDR_32BIT, len)
+                for i in 0..len
+                    var b = str.byte_at_or(src, off + i, 0)
+                    if text and b == 10
+                        b = 0
+                    self.put(b)
+                self.put_end()
+                at = at + len
+                off = off + len
+
+    // Whether the `n` bytes at backplane address `addr` are bytes `off`
+    // to `off + n` of `src`, `n` at most 64.
+    fn bp_matches(self, addr: Int, src: Str, off: Int, n: Int) -> Bool [hw, mutate]
+        self.set_window(addr)
+        self.take_begin(FUNC_BACKPLANE, (addr & WINDOW_MASK) | ADDR_32BIT, n)
+        var same = true
+        for i in 0..n
+            if self.take() != str.byte_at_or(src, off + i, 0)
+                // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+                same = false
+        self.take_end()
+        same

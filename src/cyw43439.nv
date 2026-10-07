@@ -1,0 +1,449 @@
+// cyw43439: Infineon's CYW43439 wireless chip on its gSPI bus: power
+// it on, download its firmware, NVRAM and CLM blob, and drive its own
+// GPIO pins through the firmware.
+//
+// A board's device table binds the chip to this driver:
+//
+//     devices
+//         wifi  Cyw43439  from "cyw43439-nv"  on spi0  cs wl_cs  irq wl_dio
+//
+// and the board hands `attach` its SPI bus, its GPIO and the wiring.
+// The chip has a power and reset enable of its own, WL_REG_ON, which
+// the wiring record has no word for, so `bring_up` takes that pin.
+//
+// `bring_up` runs the order of Embassy's `cyw43` crate (`spi.rs`
+// `init`, `runner.rs` `init`, `chip.rs`, `control.rs` `load_clm`;
+// MIT/Apache, nothing ported), which follows Infineon's WHD and the
+// pico-sdk's cyw43-driver:
+//
+//   1. the data line held low across a WL_REG_ON pulse, 20 ms low then
+//      high, and 250 ms for the chip to start;
+//   2. the bus test register read until it answers 0xFEEDBEAD (at most
+//      500 ms, Embassy's bound, embassy-rs/embassy#6948, so a chip that
+//      never answers cannot hang the bring-up), the read-write test
+//      register written and read back;
+//   3. 32-bit little-endian words, high-speed mode, the interrupt
+//      active high, wake-up, a 4-byte response delay on function 1,
+//      and the status word after every transaction; the two test
+//      registers read again in the new word size;
+//   4. the bus's error interrupts cleared and the ones Embassy enables
+//      enabled;
+//   5. the ALP clock requested and waited for (100 ms), the function-2
+//      watermark set to 0x10 and read back (Embassy's check, which WHD
+//      does not have), the request cleared, and the chip id read from
+//      ChipCommon;
+//   6. the WLAN core and the SOCSRAM core disabled and SOCSRAM reset,
+//      then SRAM bank 3's remap disabled, which the 4343x need;
+//   7. the firmware written to RAM at 0, and sampled back at its start,
+//      at a third, at two thirds and at its end (Embassy's
+//      `verify_download`);
+//   8. the NVRAM written at the top of RAM, below the length word, and
+//      the length word, the length in words and its complement, written
+//      and read back (Embassy's check: without it the firmware never
+//      finds the NVRAM and function 2 never becomes ready);
+//   9. the WLAN core reset and checked up, the HT clock waited for
+//      (500 ms);
+//  10. the SDIO core's host interrupt mask, function 2's packet
+//      interrupt alone, the function-2 watermark at 0x20, and function 2
+//      waited for (1000 ms);
+//  11. the pad pulls cleared, the HT clock requested and waited for;
+//  12. the CLM blob loaded through the `clmload` iovar, in chunks of
+//      1024 bytes, and `clmload_status` read as 0.
+//
+// One fix of Embassy's is not kept because it does not arise:
+// `disable_device_core` reads the reset control twice, the first read
+// unawaited and so never made; this driver reads it once.
+//
+// The chip's GPIO pins are the firmware's: `gpio_set` sets one through
+// the `gpioout` iovar (a mask, then the levels), as Embassy's
+// `Control::gpio_set` does.  The Pico W boards' LED is GPIO0, which
+// `led_set` drives.  `gpio_out` reads the level ChipCommon's GPIO output
+// register holds, through the backplane.
+//
+// One chip per program: the bring-up's state is module state.
+
+use embedded_hal.{ BoardSpi, BoardGpio, BoardTimer, GpioOut, Timer }
+use dev_bus.{ DeviceWiring }
+use dev_id.{ DeviceId, Identifiable }
+use cyw43_gspi
+use cyw43_gspi.{ Gspi }
+use cyw43_ioctl
+use cyw43_ioctl.{ Cyw43Reply }
+use cyw43439_blobs
+
+// What `bring_up` answers: 0 when the chip is up, or the step that
+// failed.
+let UP = 0
+let FAIL_BUS_TEST = 1
+let FAIL_TEST_PATTERN = 2
+let FAIL_WORD_SIZE = 3
+let FAIL_WATERMARK = 4
+let FAIL_ALP_CLOCK = 5
+let FAIL_CHIP_ID = 6
+let FAIL_FIRMWARE = 7
+let FAIL_NVRAM = 8
+let FAIL_CORE = 9
+let FAIL_HT_CLOCK = 10
+let FAIL_F2_READY = 11
+let FAIL_CLM = 12
+let FAIL_NO_CS = 13
+
+// The chip's id in ChipCommon's first register.
+let CHIP_ID = 43439
+
+// The bus's control word (step 3): WORD_LENGTH_32 (0x01), HIGH_SPEED
+// (0x10), INTERRUPT_POLARITY_HIGH (0x20), WAKE_UP (0x80); the response
+// delay 4 in byte 1; STATUS_ENABLE and INTR_WITH_STATUS in byte 2.
+let BUS_CTRL = 0x000304B1
+let TEST_PATTERN = 0x12345678
+// The error interrupts (DATA_UNAVAILABLE, COMMAND_ERROR, DATA_ERROR,
+// F1_OVERFLOW) and the ones enabled with them (F2_F3_FIFO_RD_UNDERFLOW,
+// F2_F3_FIFO_WR_OVERFLOW, F2_PACKET_AVAILABLE).
+let IRQ_ERRORS = 0x99
+let IRQ_ENABLED = 0xBE
+let IRQ_F2_PACKET_AVAILABLE = 0x20
+let STATUS_F2_RX_READY = 0x20
+
+// CHIP_CLOCK_CSR: ALP_AVAIL_REQ, ALP_AVAIL, HT_AVAIL_REQ, HT_AVAIL.
+let CSR_ALP_REQ = 0x08
+let CSR_ALP_AVAIL = 0x40
+let CSR_HT_REQ = 0x10
+let CSR_HT_AVAIL = 0x80
+
+// The backplane: ChipCommon and its GPIO output register, the cores'
+// wrappers (their base plus 0x100000), the SOCSRAM core, the SDIO core.
+let CHIPCOMMON = 0x18000000
+let CHIPCOMMON_GPIO_OUT = 0x18000064
+let WLAN_WRAPPER = 0x18103000
+let SOCSRAM_WRAPPER = 0x18104000
+let SOCSRAM = 0x18004000
+let SDIOD = 0x18002000
+let SDIO_INT_HOST_MASK = 0x24
+let I_HMB_SW_MASK = 0xF0
+// A wrapper's IO control and reset control: FGC, CLOCK_EN; RESET.
+let AI_IOCTRL = 0x408
+let AI_RESETCTRL = 0x800
+let IOCTRL_FGC = 0x02
+let IOCTRL_CLOCK_EN = 0x01
+// RAM: 512 KB from 0; the NVRAM's length word is its last.
+let RAM_SIZE = 0x80000
+let WATERMARK_SPI = 0x20
+
+// The CLM download: `clmload`, a 12-byte header (the flags, the type 2,
+// the chunk's length, a CRC of 0), the chunk.  The flags: HANDLER_VER,
+// BEGIN on the first chunk, END on the last.
+let CLM_CHUNK = 1024
+let DL_HANDLER_VER = 0x1000
+let DL_BEGIN = 0x0002
+let DL_END = 0x0004
+let DL_TYPE_CLM = 2
+
+// Whether `bring_up` has run to its end since the program started.
+var chip_up = false
+
+// The chip on a board: its gSPI and its wiring.
+pub @value
+struct Cyw43439
+    gspi: Gspi
+    w: DeviceWiring
+
+// Waits up to `ms` milliseconds for the bits `mask` of the 8-bit backplane
+// register `reg` to be set; answers whether they were.
+fn wait_csr(g: Gspi, reg: Int, mask: Int, ms: Int) -> Bool [hw, mutate]
+    let t = BoardTimer { id: 0 }
+    for _i in 0..(ms * 10)
+        if (g.read(cyw43_gspi.FUNC_BACKPLANE, reg, 1) & mask) == mask
+            return true
+        t.delay_us(100)
+    // cov: skip — runs only when the bits never set in time, a chip that fails its clock; the bench's chip sets them
+    (g.read(cyw43_gspi.FUNC_BACKPLANE, reg, 1) & mask) == mask
+
+// Disables a core: its IO control cleared and its reset set, unless it is
+// already in reset (Embassy's `disable_device_core`).
+fn core_disable(g: Gspi, wrapper: Int) [hw, mutate]
+    let t = BoardTimer { id: 0 }
+    if (g.bp_read(wrapper + AI_RESETCTRL, 1) & 1) != 0
+        return
+    // cov: skip — runs for a core out of reset; bring_up power-cycles the chip first, which leaves every core held in reset
+    g.bp_write(wrapper + AI_IOCTRL, 0, 1)
+    // cov: skip — as above
+    let _io = g.bp_read(wrapper + AI_IOCTRL, 1)
+    // cov: skip — as above
+    t.delay_ms(1)
+    // cov: skip — as above
+    g.bp_write(wrapper + AI_RESETCTRL, 1, 1)
+    // cov: skip — as above
+    t.delay_ms(1)
+
+// Resets a core and leaves it running (Embassy's `reset_device_core`).
+fn core_reset(g: Gspi, wrapper: Int) [hw, mutate]
+    let t = BoardTimer { id: 0 }
+    core_disable(g, wrapper)
+    g.bp_write(wrapper + AI_IOCTRL, IOCTRL_FGC | IOCTRL_CLOCK_EN, 1)
+    let _io = g.bp_read(wrapper + AI_IOCTRL, 1)
+    g.bp_write(wrapper + AI_RESETCTRL, 0, 1)
+    t.delay_ms(1)
+    g.bp_write(wrapper + AI_IOCTRL, IOCTRL_CLOCK_EN, 1)
+    let _io2 = g.bp_read(wrapper + AI_IOCTRL, 1)
+    t.delay_ms(1)
+
+// Whether a core runs: its clock enabled without FGC, out of reset.
+fn core_is_up(g: Gspi, wrapper: Int) -> Bool [hw, mutate]
+    let ioctrl = g.bp_read(wrapper + AI_IOCTRL, 1)
+    let rst = g.bp_read(wrapper + AI_RESETCTRL, 1)
+    (ioctrl & (IOCTRL_FGC | IOCTRL_CLOCK_EN)) == IOCTRL_CLOCK_EN and (rst & 1) == 0
+
+// Whether the backplane at `addr` holds `src` at four sample points.
+fn verify(g: Gspi, addr: Int, src: Str, n: Int) -> Bool [hw, mutate]
+    var ok = true
+    for k in 0..4
+        let off = ((n - 16) * k / 3) & 0x7FFFFFFC
+        if not g.bp_matches(addr + off, src, off, 16)
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            ok = false
+    ok
+
+impl Cyw43439
+    // The chip on `bus` with its chip select `w.cs`, as the board's device
+    // table binds it.  Nothing is sent until `bring_up`.
+    fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Cyw43439
+        Cyw43439 { gspi: Gspi { bus: bus, pins: pins, cs: w.cs ?? -1 }, w: w }
+
+    // Whether `bring_up` has run to its end.
+    fn is_up(self) -> Bool [mutate]
+        chip_up
+
+    // Powers the chip on through its WL_REG_ON pin `wl_on`, brings its bus
+    // up, downloads its firmware, NVRAM and CLM blob and waits for its
+    // firmware to answer.  Answers UP (0), or the step that failed.  The
+    // SPI bus is initialised at 25 MHz, half the gSPI's 50 MHz.
+    fn bring_up(self, wl_on: Int) -> Int [hw, mutate]
+        let g = self.gspi
+        let t = BoardTimer { id: 0 }
+        chip_up = false
+        if g.cs < 0
+            return FAIL_NO_CS
+        g.forget()
+        cyw43_ioctl.ioctl_reset()
+        g.pins.mode(g.cs, 1)
+        g.pins.set(g.cs, 1)
+        g.pins.mode(wl_on, 1)
+        g.bus.init(25000000, 0)
+        // 1. The data line low across the WL_REG_ON pulse: a zero byte
+        //    leaves it driven low (the pico-sdk's cyw43_spi_gpio_setup).
+        let _low = g.bus.transfer(0)
+        g.pins.set(wl_on, 0)
+        t.delay_ms(20)
+        g.pins.set(wl_on, 1)
+        t.delay_ms(250)
+        // 2. The bus test registers, in 16-bit words.
+        for _i in 0..500
+            if g.read32_swapped(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_TEST_RO) == cyw43_gspi.FEEDBEAD
+                break
+            t.delay_ms(1)
+        if g.read32_swapped(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_TEST_RO) != cyw43_gspi.FEEDBEAD
+            return FAIL_BUS_TEST
+        g.write32_swapped(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_TEST_RW, TEST_PATTERN)
+        if g.read32_swapped(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_TEST_RW) != TEST_PATTERN
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_TEST_PATTERN
+        // 3. 32-bit words, and the test registers again.
+        let _ctrl = g.read32_swapped(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_CTRL)
+        g.write32_swapped(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_CTRL, BUS_CTRL)
+        let _ctrl8 = g.read(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_CTRL, 1)
+        if g.read(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_TEST_RO, 4) != cyw43_gspi.FEEDBEAD
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_WORD_SIZE
+        if g.read(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_TEST_RW, 4) != TEST_PATTERN
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_WORD_SIZE
+        g.write(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_RESP_DELAY_F1, 4, 1)
+        // 4. The bus's interrupts.
+        g.write(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_INTERRUPT, IRQ_ERRORS, 1)
+        g.write(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_INTERRUPT_ENABLE, IRQ_ENABLED, 2)
+        // 5. The ALP clock, the watermark, the chip id.
+        g.write(cyw43_gspi.FUNC_BACKPLANE, cyw43_gspi.REG_BP_CHIP_CLOCK_CSR, CSR_ALP_REQ, 1)
+        g.write(cyw43_gspi.FUNC_BACKPLANE, cyw43_gspi.REG_BP_FUNCTION2_WATERMARK, 0x10, 1)
+        if g.read(cyw43_gspi.FUNC_BACKPLANE, cyw43_gspi.REG_BP_FUNCTION2_WATERMARK, 1) != 0x10
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_WATERMARK
+        if not wait_csr(g, cyw43_gspi.REG_BP_CHIP_CLOCK_CSR, CSR_ALP_AVAIL, 100)
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_ALP_CLOCK
+        g.write(cyw43_gspi.FUNC_BACKPLANE, cyw43_gspi.REG_BP_CHIP_CLOCK_CSR, 0, 1)
+        if g.bp_read(CHIPCOMMON, 2) != CHIP_ID
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_CHIP_ID
+        // 6. The cores, and SRAM bank 3's remap.
+        core_disable(g, WLAN_WRAPPER)
+        core_disable(g, SOCSRAM_WRAPPER)
+        core_reset(g, SOCSRAM_WRAPPER)
+        g.bp_write(SOCSRAM + 0x10, 3, 4)
+        g.bp_write(SOCSRAM + 0x44, 0, 4)
+        // 7. The firmware, at 0.
+        let fw = cyw43439_blobs.firmware
+        let fw_len = str.len(fw)
+        g.bp_write_str(0, fw, fw_len, false)
+        if not verify(g, 0, fw, fw_len)
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_FIRMWARE
+        // 8. The NVRAM, its NULs and its padding, and its length word.
+        let nv = cyw43439_blobs.nvram
+        let nv_len = (str.len(nv) + 2 + 3) & 0x7FFFFFFC
+        let nv_addr = RAM_SIZE - 4 - nv_len
+        g.bp_write_str(nv_addr, nv, nv_len, true)
+        let words = nv_len / 4
+        let magic = int.shl((~words) & 0xFFFF, 16) | words
+        g.bp_write(RAM_SIZE - 4, magic, 4)
+        if g.bp_read(RAM_SIZE - 4, 4) != magic
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_NVRAM
+        // 9. The WLAN core, then the HT clock.
+        core_reset(g, WLAN_WRAPPER)
+        if not core_is_up(g, WLAN_WRAPPER)
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_CORE
+        if not wait_csr(g, cyw43_gspi.REG_BP_CHIP_CLOCK_CSR, CSR_HT_AVAIL, 500)
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_HT_CLOCK
+        // 10. The interrupts the control path uses, and function 2.
+        g.bp_write(SDIOD + SDIO_INT_HOST_MASK, I_HMB_SW_MASK, 4)
+        g.write(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_INTERRUPT_ENABLE, IRQ_F2_PACKET_AVAILABLE, 2)
+        g.write(cyw43_gspi.FUNC_BACKPLANE, cyw43_gspi.REG_BP_FUNCTION2_WATERMARK, WATERMARK_SPI, 1)
+        for _i in 0..1000
+            if (g.read(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_STATUS, 4) & STATUS_F2_RX_READY) != 0
+                break
+            t.delay_ms(1)
+        if (g.read(cyw43_gspi.FUNC_BUS, cyw43_gspi.REG_BUS_STATUS, 4) & STATUS_F2_RX_READY) == 0
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_F2_READY
+        // 11. The pulls, and the HT clock asked for.
+        g.write(cyw43_gspi.FUNC_BACKPLANE, cyw43_gspi.REG_BP_PULL_UP, 0, 1)
+        let _pull = g.read(cyw43_gspi.FUNC_BACKPLANE, cyw43_gspi.REG_BP_PULL_UP, 1)
+        g.write(cyw43_gspi.FUNC_BACKPLANE, cyw43_gspi.REG_BP_CHIP_CLOCK_CSR, CSR_HT_REQ, 1)
+        if not wait_csr(g, cyw43_gspi.REG_BP_CHIP_CLOCK_CSR, CSR_HT_AVAIL, 500)
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_HT_CLOCK
+        // 12. The CLM blob.
+        if not self.load_clm()
+            // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
+            return FAIL_CLM
+        chip_up = true
+        UP
+
+    // Loads the CLM blob in chunks of 1024 bytes and reads
+    // `clmload_status`; answers whether every chunk was taken and the
+    // status is 0.
+    fn load_clm(self) -> Bool [hw, mutate]
+        let g = self.gspi
+        let clm = cyw43439_blobs.clm
+        let n = str.len(clm)
+        var r: Cyw43Reply = Vec.new()
+        var ok = true
+        for k in 0..((n + CLM_CHUNK - 1) / CLM_CHUNK)
+            let off = k * CLM_CHUNK
+            var len = n - off
+            if len > CLM_CHUNK
+                // cov: skip — runs for a CLM blob over 1024 bytes; the 43439A0's is 984
+                len = CLM_CHUNK
+            var flag = DL_HANDLER_VER
+            if off == 0
+                flag = flag | DL_BEGIN
+            if off + len == n
+                flag = flag | DL_END
+            if ok
+                ok = cyw43_ioctl.ioctl_begin(g, cyw43_ioctl.IOCTL_SET, cyw43_ioctl.CMD_SET_VAR, 8 + 12 + len)
+            if ok
+                cyw43_ioctl.put_name(g, "clmload")
+                cyw43_ioctl.put16(g, flag)
+                cyw43_ioctl.put16(g, DL_TYPE_CLM)
+                cyw43_ioctl.put32(g, len)
+                cyw43_ioctl.put32(g, 0)
+                for i in 0..len
+                    g.put(str.byte_at_or(clm, off + i, 0))
+                cyw43_ioctl.ioctl_end(g)
+                ok = cyw43_ioctl.ioctl_wait(g, 1000, r) == 0
+        if not ok
+            // cov: skip — the firmware refused a chunk; the bench's chip took each
+            return false
+        self.get_iovar("clmload_status", 4, r) and self.reply_u32(r) == 0
+
+    // Reads iovar `name`, whose value is `len` bytes, into `out`; answers
+    // whether the firmware answered with success.
+    fn get_iovar(self, name: Str, len: Int, var out: Cyw43Reply) -> Bool [hw, mutate]
+        let g = self.gspi
+        var data = str.len(name) + 1
+        if data < len
+            data = len
+        if not cyw43_ioctl.ioctl_begin(g, cyw43_ioctl.IOCTL_GET, cyw43_ioctl.CMD_GET_VAR, data)
+            // cov: skip — no credit; see ioctl_begin
+            return false
+        cyw43_ioctl.put_name(g, name)
+        for _i in 0..(data - str.len(name) - 1)
+            g.put(0)
+        cyw43_ioctl.ioctl_end(g)
+        cyw43_ioctl.ioctl_wait(g, 1000, out) == 0
+
+    // The first four bytes of a reply, little-endian.
+    fn reply_u32(self, r: Cyw43Reply) -> Int
+        if r.len() < 4
+            // cov: skip — a reply shorter than its value; the bench's firmware answers clmload_status whole
+            return -1
+        (r[0] as Int) | int.shl(r[1] as Int, 8) | int.shl(r[2] as Int, 16) | int.shl(r[3] as Int, 24)
+
+    // The firmware's version string, the `ver` iovar, into `out`, its
+    // terminating NUL and what follows it dropped; answers whether the
+    // firmware answered.
+    fn version(self, var out: Cyw43Reply) -> Bool [hw, mutate]
+        if not chip_up
+            return false
+        if not self.get_iovar("ver", 128, out)
+            // cov: skip — the firmware refused `ver`; the bench's chip answers it
+            return false
+        let n = out.len()
+        var end = n
+        for i in 0..n
+            if out[n - 1 - i] == 0
+                end = n - 1 - i
+        for _i in 0..(n - end)
+            let _b = out.pop()
+        true
+
+    // Sets the chip's GPIO `pin` (0 to 2) high when `on`, through the
+    // `gpioout` iovar; answers whether the firmware took it.
+    fn gpio_set(self, pin: Int, on: Bool) -> Bool [hw, mutate]
+        if not chip_up or pin < 0 or pin > 2
+            return false
+        let g = self.gspi
+        let bit = int.shl(1, pin)
+        let level = if on then bit else 0
+        if not cyw43_ioctl.ioctl_begin(g, cyw43_ioctl.IOCTL_SET, cyw43_ioctl.CMD_SET_VAR, 8 + 8)
+            // cov: skip — no credit; see ioctl_begin
+            return false
+        cyw43_ioctl.put_name(g, "gpioout")
+        cyw43_ioctl.put32(g, bit)
+        cyw43_ioctl.put32(g, level)
+        cyw43_ioctl.ioctl_end(g)
+        var r: Cyw43Reply = Vec.new()
+        cyw43_ioctl.ioctl_wait(g, 1000, r) == 0
+
+    // The level of the chip's GPIO `pin` as ChipCommon's output register
+    // holds it, read through the backplane; -1 before `bring_up`.
+    fn gpio_out(self, pin: Int) -> Int [hw, mutate]
+        if not chip_up
+            return -1
+        int.shr_logical(self.gspi.bp_read(CHIPCOMMON_GPIO_OUT, 4), pin & 31) & 1
+
+    // The board's LED, on the Pico W boards the chip's GPIO0.
+    fn led_set(self, on: Bool) -> Bool [hw, mutate]
+        self.gpio_set(0, on)
+
+impl Identifiable[hw, mutate] for Cyw43439
+    // The chip id (43439) and revision from ChipCommon's first register:
+    // the id in bits 0 to 15, the revision in bits 16 to 19.  `None`
+    // before `bring_up`, when the bus is not up to answer.
+    fn device_id(self) -> ?DeviceId [hw, mutate]
+        if not chip_up
+            return None
+        let v = self.gspi.bp_read(CHIPCOMMON, 4)
+        Some(DeviceId { who: v & 0xFFFF, rev: Some(int.shr_logical(v, 16) & 0xF) })

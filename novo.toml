@@ -1,0 +1,33 @@
+[package]
+name        = "cyw43439-nv"
+version     = "0.1.0"
+description = "A driver for Infineon's CYW43439 wireless chip on its gSPI bus: the bus protocol over embedded-hal-nv's SpiBus, the chip's power-on, its firmware, NVRAM and CLM downloads, the ioctl path, and the chip's own GPIO pins, which drive the Pico W boards' LED.  Carries Infineon's firmware blobs under their own licence."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["cyw43439", "wifi", "gspi", "pico-w"]
+repository  = "https://github.com/novolang/cyw43439-nv"
+maintainers = ["novo-lang"]
+# The toolchain floor: the [assets] table and the board-layer fixes of 0.19.2.
+novo        = ">= 0.19.2"
+
+[dependencies]
+# The board's SPI bus and GPIO handles, and the SpiBus, GpioOut and
+# Timer traits they implement.
+embedded-hal-nv = "^0.2.1"
+# The wiring record a board's device table hands `attach`, and the
+# Identifiable trait the driver implements.
+devices-nv      = "^0.2.0"
+
+# The chip's firmware, its CLM blob and the Pico W boards' NVRAM, as
+# Embassy's cyw43-firmware carries them (taken from
+# georgerobotics/cyw43-driver), under Infineon's Permissive Binary
+# License, which blobs/LICENSE-permissive-binary-license-1.0.txt holds.
+# The build writes the module `cyw43439_blobs`, one string constant per
+# file holding its bytes.
+[assets]
+module   = "cyw43439_blobs"
+firmware = "blobs/43439A0.bin"
+clm      = "blobs/43439A0_clm.bin"
+nvram    = "blobs/nvram_rp2040.txt"

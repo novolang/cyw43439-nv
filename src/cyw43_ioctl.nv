@@ -1,0 +1,207 @@
+// cyw43_ioctl: the CYW43439 firmware's control path: an ioctl sent as
+// a frame on the WLAN function, and its reply taken from the frames the
+// chip queues.
+//
+// Once its firmware runs, the chip takes commands as frames written to
+// function 2, each an SDPCM header (12 bytes: the frame's length and
+// its complement, a sequence number, the channel, 0 for control, and
+// the header's length) followed by a CDC header (16 bytes: the command,
+// the data's length, the flags with the kind, 0 a get and 2 a set, and
+// the interface in bits 12 to 15, an id and a status) and the command's
+// data.  The chip answers on the same channel with a frame carrying the
+// same id, the status (0 for success) and the reply's data; between
+// them it may queue frames of its own, events on channel 1 and data on
+// channel 2, which this path reads and drops.  Whether a frame waits,
+// and its length, are in the bus's status register (bit 8, and bits 9
+// to 19).  All multi-byte fields are little-endian.
+//
+// Flow control: each frame from the chip on channels 0 to 2 carries
+// the highest sequence number the host may send (its bus data credit).
+// A frame goes out only while the next sequence number is below it; a
+// credit more than 0x40 ahead of the host is taken as the host's
+// sequence number plus 2, the bound Embassy's `update_credit` applies
+// (`cyw43/src/runner.rs`), which follows WHD.
+//
+// Two named iovars carry most commands: GET_VAR (262) and SET_VAR (263),
+// whose data is the variable's name, a NUL, and its value.
+//
+// One ioctl is in flight at a time, so the sequence number, the credit
+// and the id are module state.
+
+use embedded_hal.{ BoardTimer, Timer }
+use cyw43_gspi.{ Gspi, FUNC_BUS, FUNC_WLAN, REG_BUS_STATUS }
+
+let IOCTL_GET = 0
+let IOCTL_SET = 2
+let CMD_GET_VAR = 262
+let CMD_SET_VAR = 263
+
+// The bus's status register: a frame waits on function 2, and its
+// length.
+let STATUS_F2_PKT_AVAILABLE = 0x100
+let STATUS_F2_PKT_LEN_MASK = 0xFFE00
+let SDPCM_HEADER = 12
+let CDC_HEADER = 16
+
+// The reply's data an ioctl keeps: 128 bytes, which holds the
+// firmware's version string and every value this driver reads.
+pub alias Cyw43Reply = Vec[u8; 128]
+
+var tx_seq = 0
+var tx_max = 1
+var ioctl_id = 0
+// Frames read that were not the reply: events and data.
+var frames_dropped = 0
+
+// Starts the control path over, as after a power cycle of the chip.
+pub fn ioctl_reset() [mutate]
+    tx_seq = 0
+    tx_max = 1
+    ioctl_id = 0
+    frames_dropped = 0
+
+// The frames the path has read and dropped since the bring-up.
+pub fn ioctl_frames_dropped() -> Int [mutate]
+    frames_dropped
+
+// Whether the chip's credit admits another frame.
+@no_alloc
+fn has_credit() -> Bool [mutate]
+    tx_seq != tx_max and ((tx_max - tx_seq) & 0x80) == 0
+
+pub fn put16(g: Gspi, v: Int) [hw, mutate]
+    g.put(v & 0xFF)
+    g.put(int.shr_logical(v, 8) & 0xFF)
+
+pub fn put32(g: Gspi, v: Int) [hw, mutate]
+    put16(g, v & 0xFFFF)
+    put16(g, int.shr_logical(v, 16) & 0xFFFF)
+
+// The bytes of `s`, then a NUL.
+pub fn put_name(g: Gspi, s: Str) [hw, mutate]
+    for i in 0..str.len(s)
+        g.put(str.byte_at_or(s, i, 0))
+    g.put(0)
+
+fn take16(g: Gspi) -> Int [hw, mutate]
+    let lo = g.take()
+    lo | int.shl(g.take(), 8)
+
+fn take32(g: Gspi) -> Int [hw, mutate]
+    let lo = take16(g)
+    lo | int.shl(take16(g), 16)
+
+// Reads one frame if one waits.  The reply to the ioctl in flight
+// answers its status, 0 or more, and leaves its data in `out`; no frame,
+// or another frame, answers -2.
+fn poll_frame(g: Gspi, var out: Cyw43Reply) -> Int [hw, mutate]
+    let st = g.read(FUNC_BUS, REG_BUS_STATUS, 4)
+    if (st & STATUS_F2_PKT_AVAILABLE) == 0
+        return -2
+    let len = int.shr_logical(st & STATUS_F2_PKT_LEN_MASK, 9)
+    g.take_begin(FUNC_WLAN, 0, len)
+    let flen = take16(g)
+    let finv = take16(g)
+    let _seq = g.take()
+    let channel = g.take()
+    let _next = g.take()
+    let hlen = g.take()
+    let _wfc = g.take()
+    let credit = g.take()
+    let _r = take16(g)
+    if flen != ((~finv) & 0xFFFF) or flen < SDPCM_HEADER or hlen < SDPCM_HEADER or hlen > flen
+        // cov: skip — a frame whose header disagrees with itself; the chip on the bench sent none
+        g.take_end()
+        // cov: skip — as above
+        return -2
+    if (channel & 0x0F) < 3
+        var m = credit
+        if ((m - tx_seq) & 0xFF) > 0x40
+            // cov: skip — a credit too far ahead; the bench's chip never sent one
+            m = (tx_seq + 2) & 0xFF
+        tx_max = m
+    for _i in 0..(hlen - SDPCM_HEADER)
+        let _skip = g.take()
+    var result = -2
+    if (channel & 0x0F) == 0 and flen >= hlen + CDC_HEADER
+        let _cmd = take32(g)
+        let clen = take32(g)
+        let _flags = take16(g)
+        let id = take16(g)
+        let cst = take32(g)
+        if id == ioctl_id
+            out.clear()
+            var n = clen
+            if n > flen - hlen - CDC_HEADER
+                // cov: skip — a reply whose CDC length runs past its frame; the bench's firmware sent none
+                n = flen - hlen - CDC_HEADER
+            for _i in 0..n
+                let _ok = out.push(g.take() as u8)
+            result = cst
+    if result == -2
+        frames_dropped = frames_dropped + 1
+    g.take_end()
+    result
+
+// Waits about `ms` milliseconds (a poll every 100 µs, the polls' own
+// time on top) for the chip's credit to admit a frame,
+// reading the frames it queues meanwhile; answers whether it did.
+fn wait_credit(g: Gspi, ms: Int) -> Bool [hw, mutate]
+    let t = BoardTimer { id: 0 }
+    var drop: Cyw43Reply = Vec.new()
+    for _i in 0..(ms * 10)
+        if has_credit()
+            return true
+        // cov: skip — runs only while the chip withholds its credit; the bench's chip always granted it
+        let _r = poll_frame(g, drop)
+        // cov: skip — as above
+        t.delay_us(100)
+    // cov: skip — as above
+    has_credit()
+
+// Starts ioctl `cmd` of kind `kind` with `data_len` bytes of data, which
+// the caller sends with `g.put` (or `put16`, `put32`, `put_name`), then
+// `ioctl_end`.  Answers false, sending nothing, when the chip's credit
+// does not admit a frame within 100 ms.
+pub fn ioctl_begin(g: Gspi, kind: Int, cmd: Int, data_len: Int) -> Bool [hw, mutate]
+    if not wait_credit(g, 100)
+        // cov: skip — the chip withheld its credit; the bench's chip never did
+        return false
+    let total = SDPCM_HEADER + CDC_HEADER + data_len
+    let seq = tx_seq
+    tx_seq = (tx_seq + 1) & 0xFF
+    ioctl_id = (ioctl_id + 1) & 0xFFFF
+    g.put_begin(FUNC_WLAN, 0, (total + 3) & 0x7FC)
+    put16(g, total)
+    put16(g, (~total) & 0xFFFF)
+    g.put(seq)
+    g.put(0)
+    g.put(0)
+    g.put(SDPCM_HEADER)
+    put32(g, 0)
+    put32(g, cmd)
+    put32(g, data_len)
+    put16(g, kind)
+    put16(g, ioctl_id)
+    put32(g, 0)
+    true
+
+// Pads the frame to a whole word and ends its transaction.
+pub fn ioctl_end(g: Gspi) [hw, mutate]
+    g.put_end()
+
+// Waits up to `ms` milliseconds for the reply to the ioctl in flight and
+// answers its status, 0 for success, with the reply's data in `out`; -1
+// when no reply came.
+pub fn ioctl_wait(g: Gspi, ms: Int, var out: Cyw43Reply) -> Int [hw, mutate]
+    let t = BoardTimer { id: 0 }
+    var r = -2
+    for _i in 0..(ms * 10)
+        r = poll_frame(g, out)
+        if r != -2
+            break
+        t.delay_us(100)
+    if r == -2
+        // cov: skip — the chip did not reply in time; the bench's chip always did
+        return -1
+    r
