@@ -87,6 +87,7 @@ let FAIL_HT_CLOCK = 10
 let FAIL_F2_READY = 11
 let FAIL_CLM = 12
 let FAIL_NO_CS = 13
+let FAIL_NO_POWER = 14
 
 // The chip's id in ChipCommon's first register.
 let CHIP_ID = 43439
@@ -213,16 +214,18 @@ impl Cyw43439
     fn is_up(self) -> Bool [mutate]
         chip_up
 
-    // Powers the chip on through its WL_REG_ON pin `wl_on`, brings its bus
-    // up, downloads its firmware, NVRAM and CLM blob and waits for its
-    // firmware to answer.  Answers UP (0), or the step that failed.  The
-    // SPI bus is initialised at 25 MHz, half the gSPI's 50 MHz.
-    fn bring_up(self, wl_on: Int) -> Int [hw, mutate]
+    // Powers the chip on through its WL_REG_ON pin, the wiring's enable
+    // pin `en`, brings its bus up, downloads its firmware, NVRAM and CLM
+    // blob and waits for its firmware to answer.  Answers UP (0), or the
+    // step that failed.  The SPI bus is initialised at 25 MHz, half the
+    // gSPI's 50 MHz.
+    fn bring_up(self) -> Int [hw, mutate]
         let g = self.gspi
         let t = BoardTimer { id: 0 }
         chip_up = false
         if g.cs < 0
             return FAIL_NO_CS
+        let Some(wl_on) = self.w.en else return FAIL_NO_POWER
         g.forget()
         cyw43_ioctl.ioctl_reset()
         g.pins.mode(g.cs, 1)

@@ -22,7 +22,7 @@ A board's device table binds the chip to the driver, the way
         wl_cs    25
         wl_clk   29
     devices
-        wifi  Cyw43439  from "cyw43439-nv"  on spi0  cs wl_cs  irq wl_dio
+        wifi  Cyw43439  from "cyw43439-nv"  on spi0  cs wl_cs  irq wl_dio  en wl_on
 ```
 
 and a program reaches it as `bsp.board.wifi()`:
@@ -33,7 +33,7 @@ use cyw43439
 @tier(embedded)
 fn main() [hw, mutate]
     let wifi = bsp.board.wifi()
-    if wifi.bring_up(bsp.board.wl_on()) == 0
+    if wifi.bring_up() == 0
         var on = true
         while true
             let _ok = wifi.led_set(on)
@@ -46,8 +46,8 @@ On the Pico 2 W the board's `hal.gpio` also reaches the chip's pins, so
 
 | Method | What it does |
 |---|---|
-| `Cyw43439.attach(bus, pins, w)` | the chip on the board's SPI bus with the chip select `w.cs`, as the device table builds it; nothing is sent |
-| `bring_up(wl_on)` | powers the chip on through its WL_REG_ON pin and brings it up; answers `UP` (0) or the step that failed (`FAIL_BUS_TEST` 1 to `FAIL_NO_CS` 13) |
+| `Cyw43439.attach(bus, pins, w)` | the chip on the board's SPI bus with the chip select `w.cs` and the power pin `w.en`, as the device table builds it; nothing is sent |
+| `bring_up()` | powers the chip on through its WL_REG_ON pin, the wiring's `en`, and brings it up; answers `UP` (0) or the step that failed (`FAIL_BUS_TEST` 1 to `FAIL_NO_CS` 13, and `FAIL_NO_POWER` 14 for a wiring with no `en`) |
 | `is_up()` | whether `bring_up` has run to its end |
 | `version(var out)` | the firmware's version string, the `ver` iovar |
 | `gpio_set(pin, on)` | sets the chip's GPIO 0 to 2 through the `gpioout` iovar |
@@ -55,9 +55,9 @@ On the Pico 2 W the board's `hal.gpio` also reaches the chip's pins, so
 | `led_set(on)` | `gpio_set(0, on)`, the Pico W boards' LED |
 | `device_id()` | devices-nv's `Identifiable`: the chip id (43439) and its revision |
 
-`bring_up` takes the power pin because devices-nv's wiring record has
-no word for one.  The driver is for one chip in a program: its state is
-module state.
+The power pin is the device table's `en`, which devices-nv 0.3.0's
+wiring record carries.  The driver is for one chip in a program: its
+state is module state.
 
 ## The bus
 
@@ -94,4 +94,9 @@ device they are constant data in the image's flash, about 233 KB.
 The driver is measured on a board: the Pico 2 W package's suite,
 `orbit/bsp/raspberrypi/rp2350/pico2w/tests/run.sh`, brings the chip up,
 reads its version and drives its LED, and reads back the line coverage
-of this package's modules.
+of this package's modules: on 2026-10-07 `cyw43_gspi` 119 of 122
+lines, `cyw43_ioctl` 91 of 99 and `cyw43439` 171 of 197, every line
+not run marked at its site with its reason, a failure path only a
+failing chip takes.  The registry's coverage figure is the host's
+measure, which cannot reach the bring-up, and is lower by design; the
+board's is the one that counts for this package.

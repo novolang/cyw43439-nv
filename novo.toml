@@ -9,8 +9,9 @@ layer       = "host"
 tags        = ["cyw43439", "wifi", "gspi", "pico-w"]
 repository  = "https://github.com/novolang/cyw43439-nv"
 maintainers = ["novo-lang"]
-# The toolchain floor: the [assets] table and the board-layer fixes of 0.19.2.
-novo        = ">= 0.19.2"
+# The toolchain floor: devices-nv 0.3.0, whose wiring carries the power
+# pin, takes 0.19.3.
+novo        = ">= 0.19.3"
 
 [dependencies]
 # The board's SPI bus and GPIO handles, and the SpiBus, GpioOut and
@@ -18,7 +19,7 @@ novo        = ">= 0.19.2"
 embedded-hal-nv = "^0.2.1"
 # The wiring record a board's device table hands `attach`, and the
 # Identifiable trait the driver implements.
-devices-nv      = "^0.2.0"
+devices-nv      = "^0.3.0"
 
 # The chip's firmware, its CLM blob and the Pico W boards' NVRAM, as
 # Embassy's cyw43-firmware carries them (taken from
