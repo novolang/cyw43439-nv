@@ -1,0 +1,46 @@
+// gspi_tests.nv: the gSPI's command words and the halves swap, and the
+// blobs the package carries, on the host.
+//
+// The vectors are the words Embassy's `cyw43` sends for the same
+// operations: a read of the bus test register in 16-bit words is
+// 0xA0044000 on the wire (the command 0x4000A004, its halves swapped),
+// and a 4-byte backplane read at window offset 0 with the 32-bit flag
+// is 0x54000004.  The bring-up, the backplane and the ioctl path run on
+// a board: the Pico 2 W package's suite measures them there.
+
+use std.test
+use cyw43_gspi
+use cyw43439_blobs
+
+@test
+fn test_a_read_of_the_bus_test_register() [io]
+    test.assert_eq(cyw43_gspi.cmd_word(false, 0, 0x14, 4), 0x4000A004)
+    test.assert_eq(cyw43_gspi.swap16(cyw43_gspi.cmd_word(false, 0, 0x14, 4)), 0xA0044000)
+
+@test
+fn test_a_write_sets_bit_31() [io]
+    test.assert_eq(cyw43_gspi.cmd_word(true, 0, 0x18, 4), 0xC000C004)
+
+@test
+fn test_a_backplane_read_with_the_32_bit_flag() [io]
+    test.assert_eq(cyw43_gspi.cmd_word(false, 1, 0x8000, 4), 0x54000004)
+
+@test
+fn test_the_address_and_length_are_masked() [io]
+    test.assert_eq(cyw43_gspi.cmd_word(false, 2, 0x3FFFF, 0xFFF), 0x6FFFFFFF)
+
+@test
+fn test_swap16_is_its_own_inverse() [io]
+    test.assert_eq(cyw43_gspi.swap16(cyw43_gspi.swap16(0x12345678)), 0x12345678)
+    test.assert_eq(cyw43_gspi.swap16(0xFEEDBEAD), 0xBEADFEED)
+
+@test
+fn test_the_blobs_are_whole() [io]
+    test.assert_eq(str.len(cyw43439_blobs.firmware), 231077)
+    test.assert_eq(str.len(cyw43439_blobs.clm), 984)
+    test.assert_eq(str.len(cyw43439_blobs.nvram), 739)
+    // The firmware's first word, 0, and its reset vector, 0x1471.
+    test.assert_eq(str.byte_at_or(cyw43439_blobs.firmware, 4, -1), 0x71)
+    test.assert_eq(str.byte_at_or(cyw43439_blobs.firmware, 5, -1), 0x14)
+    // The NVRAM starts with its revision line.
+    test.assert_eq(str.byte_at_or(cyw43439_blobs.nvram, 0, -1), 78)
