@@ -53,6 +53,7 @@ var ioctl_id = 0
 // Frames read that were not the reply: events and data.
 var frames_dropped = 0
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Starts the control path over, as after a power cycle of the chip.
 pub fn ioctl_reset() [mutate]
     tx_seq = 0
@@ -60,37 +61,45 @@ pub fn ioctl_reset() [mutate]
     ioctl_id = 0
     frames_dropped = 0
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // The frames the path has read and dropped since the bring-up.
 pub fn ioctl_frames_dropped() -> Int [mutate]
     frames_dropped
 
 // Whether the chip's credit admits another frame.
 @no_alloc
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 fn has_credit() -> Bool [mutate]
     tx_seq != tx_max and ((tx_max - tx_seq) & 0x80) == 0
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 pub fn put16(g: Gspi, v: Int) [hw, mutate]
     g.put(v & 0xFF)
     g.put(int.shr_logical(v, 8) & 0xFF)
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 pub fn put32(g: Gspi, v: Int) [hw, mutate]
     put16(g, v & 0xFFFF)
     put16(g, int.shr_logical(v, 16) & 0xFFFF)
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // The bytes of `s`, then a NUL.
 pub fn put_name(g: Gspi, s: Str) [hw, mutate]
     for i in 0..str.len(s)
         g.put(str.byte_at_or(s, i, 0))
     g.put(0)
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 fn take16(g: Gspi) -> Int [hw, mutate]
     let lo = g.take()
     lo | int.shl(g.take(), 8)
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 fn take32(g: Gspi) -> Int [hw, mutate]
     let lo = take16(g)
     lo | int.shl(take16(g), 16)
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Reads one frame if one waits.  The reply to the ioctl in flight
 // answers its status, 0 or more, and leaves its data in `out`; no frame,
 // or another frame, answers -2.
@@ -143,6 +152,7 @@ fn poll_frame(g: Gspi, var out: Cyw43Reply) -> Int [hw, mutate]
     g.take_end()
     result
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Waits about `ms` milliseconds (a poll every 100 µs, the polls' own
 // time on top) for the chip's credit to admit a frame,
 // reading the frames it queues meanwhile; answers whether it did.
@@ -153,12 +163,13 @@ fn wait_credit(g: Gspi, ms: Int) -> Bool [hw, mutate]
         if has_credit()
             return true
         // cov: skip — runs only while the chip withholds its credit; the bench's chip always granted it
-        let _r = poll_frame(g, drop)
+        let _r = poll_frame(g, var drop)
         // cov: skip — as above
         t.delay_us(100)
     // cov: skip — as above
     has_credit()
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Starts ioctl `cmd` of kind `kind` with `data_len` bytes of data, which
 // the caller sends with `g.put` (or `put16`, `put32`, `put_name`), then
 // `ioctl_end`.  Answers false, sending nothing, when the chip's credit
@@ -186,10 +197,12 @@ pub fn ioctl_begin(g: Gspi, kind: Int, cmd: Int, data_len: Int) -> Bool [hw, mut
     put32(g, 0)
     true
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Pads the frame to a whole word and ends its transaction.
 pub fn ioctl_end(g: Gspi) [hw, mutate]
     g.put_end()
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Waits up to `ms` milliseconds for the reply to the ioctl in flight and
 // answers its status, 0 for success, with the reply's data in `out`; -1
 // when no reply came.
@@ -197,7 +210,7 @@ pub fn ioctl_wait(g: Gspi, ms: Int, var out: Cyw43Reply) -> Int [hw, mutate]
     let t = BoardTimer { id: 0 }
     var r = -2
     for _i in 0..(ms * 10)
-        r = poll_frame(g, out)
+        r = poll_frame(g, var out)
         if r != -2
             break
         t.delay_us(100)

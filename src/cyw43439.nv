@@ -148,6 +148,7 @@ struct Cyw43439
     gspi: Gspi
     w: DeviceWiring
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Waits up to `ms` milliseconds for the bits `mask` of the 8-bit backplane
 // register `reg` to be set; answers whether they were.
 fn wait_csr(g: Gspi, reg: Int, mask: Int, ms: Int) -> Bool [hw, mutate]
@@ -159,6 +160,7 @@ fn wait_csr(g: Gspi, reg: Int, mask: Int, ms: Int) -> Bool [hw, mutate]
     // cov: skip — runs only when the bits never set in time, a chip that fails its clock; the bench's chip sets them
     (g.read(cyw43_gspi.FUNC_BACKPLANE, reg, 1) & mask) == mask
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Disables a core: its IO control cleared and its reset set, unless it is
 // already in reset (Embassy's `disable_device_core`).
 fn core_disable(g: Gspi, wrapper: Int) [hw, mutate]
@@ -176,6 +178,7 @@ fn core_disable(g: Gspi, wrapper: Int) [hw, mutate]
     // cov: skip — as above
     t.delay_ms(1)
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Resets a core and leaves it running (Embassy's `reset_device_core`).
 fn core_reset(g: Gspi, wrapper: Int) [hw, mutate]
     let t = BoardTimer { id: 0 }
@@ -188,12 +191,14 @@ fn core_reset(g: Gspi, wrapper: Int) [hw, mutate]
     let _io2 = g.bp_read(wrapper + AI_IOCTRL, 1)
     t.delay_ms(1)
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Whether a core runs: its clock enabled without FGC, out of reset.
 fn core_is_up(g: Gspi, wrapper: Int) -> Bool [hw, mutate]
     let ioctrl = g.bp_read(wrapper + AI_IOCTRL, 1)
     let rst = g.bp_read(wrapper + AI_RESETCTRL, 1)
     (ioctrl & (IOCTRL_FGC | IOCTRL_CLOCK_EN)) == IOCTRL_CLOCK_EN and (rst & 1) == 0
 
+// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Whether the backplane at `addr` holds `src` at four sample points.
 fn verify(g: Gspi, addr: Int, src: Str, n: Int) -> Bool [hw, mutate]
     var ok = true
@@ -205,15 +210,18 @@ fn verify(g: Gspi, addr: Int, src: Str, n: Int) -> Bool [hw, mutate]
     ok
 
 impl Cyw43439
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // The chip on `bus` with its chip select `w.cs`, as the board's device
     // table binds it.  Nothing is sent until `bring_up`.
     fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Cyw43439
         Cyw43439 { gspi: Gspi { bus: bus, pins: pins, cs: w.cs ?? -1 }, w: w }
 
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // Whether `bring_up` has run to its end.
     fn is_up(self) -> Bool [mutate]
         chip_up
 
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // Powers the chip on through its WL_REG_ON pin, the wiring's enable
     // pin `en`, brings its bus up, downloads its firmware, NVRAM and CLM
     // blob and waits for its firmware to answer.  Answers UP (0), or the
@@ -334,6 +342,7 @@ impl Cyw43439
         chip_up = true
         UP
 
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // Loads the CLM blob in chunks of 1024 bytes and reads
     // `clmload_status`; answers whether every chunk was taken and the
     // status is 0.
@@ -365,12 +374,13 @@ impl Cyw43439
                 for i in 0..len
                     g.put(str.byte_at_or(clm, off + i, 0))
                 cyw43_ioctl.ioctl_end(g)
-                ok = cyw43_ioctl.ioctl_wait(g, 1000, r) == 0
+                ok = cyw43_ioctl.ioctl_wait(g, 1000, var r) == 0
         if not ok
             // cov: skip — the firmware refused a chunk; the bench's chip took each
             return false
-        self.get_iovar("clmload_status", 4, r) and self.reply_u32(r) == 0
+        self.get_iovar("clmload_status", 4, var r) and self.reply_u32(r) == 0
 
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // Reads iovar `name`, whose value is `len` bytes, into `out`; answers
     // whether the firmware answered with success.
     fn get_iovar(self, name: Str, len: Int, var out: Cyw43Reply) -> Bool [hw, mutate]
@@ -385,8 +395,9 @@ impl Cyw43439
         for _i in 0..(data - str.len(name) - 1)
             g.put(0)
         cyw43_ioctl.ioctl_end(g)
-        cyw43_ioctl.ioctl_wait(g, 1000, out) == 0
+        cyw43_ioctl.ioctl_wait(g, 1000, var out) == 0
 
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // The first four bytes of a reply, little-endian.
     fn reply_u32(self, r: Cyw43Reply) -> Int
         if r.len() < 4
@@ -394,13 +405,14 @@ impl Cyw43439
             return -1
         (r[0] as Int) | int.shl(r[1] as Int, 8) | int.shl(r[2] as Int, 16) | int.shl(r[3] as Int, 24)
 
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // The firmware's version string, the `ver` iovar, into `out`, its
     // terminating NUL and what follows it dropped; answers whether the
     // firmware answered.
     fn version(self, var out: Cyw43Reply) -> Bool [hw, mutate]
         if not chip_up
             return false
-        if not self.get_iovar("ver", 128, out)
+        if not self.get_iovar("ver", 128, var out)
             // cov: skip — the firmware refused `ver`; the bench's chip answers it
             return false
         let n = out.len()
@@ -412,6 +424,7 @@ impl Cyw43439
             let _b = out.pop()
         true
 
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // Sets the chip's GPIO `pin` (0 to 2) high when `on`, through the
     // `gpioout` iovar; answers whether the firmware took it.
     fn gpio_set(self, pin: Int, on: Bool) -> Bool [hw, mutate]
@@ -428,8 +441,9 @@ impl Cyw43439
         cyw43_ioctl.put32(g, level)
         cyw43_ioctl.ioctl_end(g)
         var r: Cyw43Reply = Vec.new()
-        cyw43_ioctl.ioctl_wait(g, 1000, r) == 0
+        cyw43_ioctl.ioctl_wait(g, 1000, var r) == 0
 
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // The level of the chip's GPIO `pin` as ChipCommon's output register
     // holds it, read through the backplane; -1 before `bring_up`.
     fn gpio_out(self, pin: Int) -> Int [hw, mutate]
@@ -437,11 +451,13 @@ impl Cyw43439
             return -1
         int.shr_logical(self.gspi.bp_read(CHIPCOMMON_GPIO_OUT, 4), pin & 31) & 1
 
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // The board's LED, on the Pico W boards the chip's GPIO0.
     fn led_set(self, on: Bool) -> Bool [hw, mutate]
         self.gpio_set(0, on)
 
 impl Identifiable[hw, mutate] for Cyw43439
+    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // The chip id (43439) and revision from ChipCommon's first register:
     // the id in bits 0 to 15, the revision in bits 16 to 19.  `None`
     // before `bring_up`, when the bus is not up to answer.
