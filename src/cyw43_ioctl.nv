@@ -31,29 +31,28 @@
 use embedded_hal.{ BoardTimer, Timer }
 use cyw43_gspi.{ Gspi, FUNC_BUS, FUNC_WLAN, REG_BUS_STATUS }
 
-let IOCTL_GET = 0
-let IOCTL_SET = 2
+let IOCTL_GET   = 0
+let IOCTL_SET   = 2
 let CMD_GET_VAR = 262
 let CMD_SET_VAR = 263
 
 // The bus's status register: a frame waits on function 2, and its
 // length.
 let STATUS_F2_PKT_AVAILABLE = 0x100
-let STATUS_F2_PKT_LEN_MASK = 0xFFE00
-let SDPCM_HEADER = 12
-let CDC_HEADER = 16
+let STATUS_F2_PKT_LEN_MASK  = 0xFFE00
+let SDPCM_HEADER            = 12
+let CDC_HEADER              = 16
 
 // The reply's data an ioctl keeps: 128 bytes, which holds the
 // firmware's version string and every value this driver reads.
 pub alias Cyw43Reply = Vec[u8; 128]
 
-var tx_seq = 0
-var tx_max = 1
+var tx_seq   = 0
+var tx_max   = 1
 var ioctl_id = 0
 // Frames read that were not the reply: events and data.
 var frames_dropped = 0
 
-// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Starts the control path over, as after a power cycle of the chip.
 pub fn ioctl_reset() [mutate]
     tx_seq = 0
@@ -61,28 +60,25 @@ pub fn ioctl_reset() [mutate]
     ioctl_id = 0
     frames_dropped = 0
 
-// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // The frames the path has read and dropped since the bring-up.
 pub fn ioctl_frames_dropped() -> Int [mutate]
     frames_dropped
 
 // Whether the chip's credit admits another frame.
 @no_alloc
-// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 fn has_credit() -> Bool [mutate]
     tx_seq != tx_max and ((tx_max - tx_seq) & 0x80) == 0
 
-// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
+// A 16-bit value, low byte first, as the frame's fields are sent.
 pub fn put16(g: Gspi, v: Int) [hw, mutate]
     g.put(v & 0xFF)
     g.put(int.shr_logical(v, 8) & 0xFF)
 
-// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
+// A 32-bit value as two 16-bit halves, the low half first.
 pub fn put32(g: Gspi, v: Int) [hw, mutate]
     put16(g, v & 0xFFFF)
     put16(g, int.shr_logical(v, 16) & 0xFFFF)
 
-// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // The bytes of `s`, then a NUL.
 pub fn put_name(g: Gspi, s: Str) [hw, mutate]
     for i in 0..str.len(s)
@@ -118,7 +114,7 @@ fn poll_frame(g: Gspi, var out: Cyw43Reply) -> Int [hw, mutate]
     let _wfc = g.take()
     let credit = g.take()
     let _r = take16(g)
-    if flen != ((~finv) & 0xFFFF) or flen < SDPCM_HEADER or hlen < SDPCM_HEADER or hlen > flen
+    if flen != (~finv & 0xFFFF) or flen < SDPCM_HEADER or hlen < SDPCM_HEADER or hlen > flen
         // cov: skip — a frame whose header disagrees with itself; the chip on the bench sent none
         g.take_end()
         // cov: skip — as above
@@ -129,7 +125,7 @@ fn poll_frame(g: Gspi, var out: Cyw43Reply) -> Int [hw, mutate]
             // cov: skip — a credit too far ahead; the bench's chip never sent one
             m = (tx_seq + 2) & 0xFF
         tx_max = m
-    for _i in 0..(hlen - SDPCM_HEADER)
+    for _i in 0..hlen - SDPCM_HEADER
         let _skip = g.take()
     var result = -2
     if (channel & 0x0F) == 0 and flen >= hlen + CDC_HEADER
@@ -159,7 +155,7 @@ fn poll_frame(g: Gspi, var out: Cyw43Reply) -> Int [hw, mutate]
 fn wait_credit(g: Gspi, ms: Int) -> Bool [hw, mutate]
     let t = BoardTimer { id: 0 }
     var drop: Cyw43Reply = Vec.new()
-    for _i in 0..(ms * 10)
+    for _i in 0..ms * 10
         if has_credit()
             return true
         // cov: skip — runs only while the chip withholds its credit; the bench's chip always granted it
@@ -184,7 +180,7 @@ pub fn ioctl_begin(g: Gspi, kind: Int, cmd: Int, data_len: Int) -> Bool [hw, mut
     ioctl_id = (ioctl_id + 1) & 0xFFFF
     g.put_begin(FUNC_WLAN, 0, (total + 3) & 0x7FC)
     put16(g, total)
-    put16(g, (~total) & 0xFFFF)
+    put16(g, ~total & 0xFFFF)
     g.put(seq)
     g.put(0)
     g.put(0)
@@ -197,7 +193,6 @@ pub fn ioctl_begin(g: Gspi, kind: Int, cmd: Int, data_len: Int) -> Bool [hw, mut
     put32(g, 0)
     true
 
-// cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
 // Pads the frame to a whole word and ends its transaction.
 pub fn ioctl_end(g: Gspi) [hw, mutate]
     g.put_end()
@@ -209,12 +204,11 @@ pub fn ioctl_end(g: Gspi) [hw, mutate]
 pub fn ioctl_wait(g: Gspi, ms: Int, var out: Cyw43Reply) -> Int [hw, mutate]
     let t = BoardTimer { id: 0 }
     var r = -2
-    for _i in 0..(ms * 10)
+    for _i in 0..ms * 10
         r = poll_frame(g, var out)
         if r != -2
             break
         t.delay_us(100)
     if r == -2
-        // cov: skip — the chip did not reply in time; the bench's chip always did
         return -1
     r

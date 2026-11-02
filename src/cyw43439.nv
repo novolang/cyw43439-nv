@@ -55,7 +55,7 @@
 // unawaited and so never made; this driver reads it once.
 //
 // The chip's GPIO pins are the firmware's: `gpio_set` sets one through
-// the `gpioout` iovar (a mask, then the levels), as Embassy's
+// the `gpioout` io(a mask, then the levels), as Embassy's
 // `Control::gpio_set` does.  The Pico W boards' LED is GPIO0, which
 // `led_set` drives.  `gpio_out` reads the level ChipCommon's GPIO output
 // register holds, through the backplane.
@@ -73,21 +73,21 @@ use cyw43439_blobs
 
 // What `bring_up` answers: 0 when the chip is up, or the step that
 // failed.
-let UP = 0
-let FAIL_BUS_TEST = 1
+let UP                = 0
+let FAIL_BUS_TEST     = 1
 let FAIL_TEST_PATTERN = 2
-let FAIL_WORD_SIZE = 3
-let FAIL_WATERMARK = 4
-let FAIL_ALP_CLOCK = 5
-let FAIL_CHIP_ID = 6
-let FAIL_FIRMWARE = 7
-let FAIL_NVRAM = 8
-let FAIL_CORE = 9
-let FAIL_HT_CLOCK = 10
-let FAIL_F2_READY = 11
-let FAIL_CLM = 12
-let FAIL_NO_CS = 13
-let FAIL_NO_POWER = 14
+let FAIL_WORD_SIZE    = 3
+let FAIL_WATERMARK    = 4
+let FAIL_ALP_CLOCK    = 5
+let FAIL_CHIP_ID      = 6
+let FAIL_FIRMWARE     = 7
+let FAIL_NVRAM        = 8
+let FAIL_CORE         = 9
+let FAIL_HT_CLOCK     = 10
+let FAIL_F2_READY     = 11
+let FAIL_CLM          = 12
+let FAIL_NO_CS        = 13
+let FAIL_NO_POWER     = 14
 
 // The chip's id in ChipCommon's first register.
 let CHIP_ID = 43439
@@ -95,49 +95,49 @@ let CHIP_ID = 43439
 // The bus's control word (step 3): WORD_LENGTH_32 (0x01), HIGH_SPEED
 // (0x10), INTERRUPT_POLARITY_HIGH (0x20), WAKE_UP (0x80); the response
 // delay 4 in byte 1; STATUS_ENABLE and INTR_WITH_STATUS in byte 2.
-let BUS_CTRL = 0x000304B1
+let BUS_CTRL     = 0x000304B1
 let TEST_PATTERN = 0x12345678
 // The error interrupts (DATA_UNAVAILABLE, COMMAND_ERROR, DATA_ERROR,
 // F1_OVERFLOW) and the ones enabled with them (F2_F3_FIFO_RD_UNDERFLOW,
 // F2_F3_FIFO_WR_OVERFLOW, F2_PACKET_AVAILABLE).
-let IRQ_ERRORS = 0x99
-let IRQ_ENABLED = 0xBE
+let IRQ_ERRORS              = 0x99
+let IRQ_ENABLED             = 0xBE
 let IRQ_F2_PACKET_AVAILABLE = 0x20
-let STATUS_F2_RX_READY = 0x20
+let STATUS_F2_RX_READY      = 0x20
 
 // CHIP_CLOCK_CSR: ALP_AVAIL_REQ, ALP_AVAIL, HT_AVAIL_REQ, HT_AVAIL.
-let CSR_ALP_REQ = 0x08
+let CSR_ALP_REQ   = 0x08
 let CSR_ALP_AVAIL = 0x40
-let CSR_HT_REQ = 0x10
-let CSR_HT_AVAIL = 0x80
+let CSR_HT_REQ    = 0x10
+let CSR_HT_AVAIL  = 0x80
 
 // The backplane: ChipCommon and its GPIO output register, the cores'
 // wrappers (their base plus 0x100000), the SOCSRAM core, the SDIO core.
-let CHIPCOMMON = 0x18000000
+let CHIPCOMMON          = 0x18000000
 let CHIPCOMMON_GPIO_OUT = 0x18000064
-let WLAN_WRAPPER = 0x18103000
-let SOCSRAM_WRAPPER = 0x18104000
-let SOCSRAM = 0x18004000
-let SDIOD = 0x18002000
-let SDIO_INT_HOST_MASK = 0x24
-let I_HMB_SW_MASK = 0xF0
+let WLAN_WRAPPER        = 0x18103000
+let SOCSRAM_WRAPPER     = 0x18104000
+let SOCSRAM             = 0x18004000
+let SDIOD               = 0x18002000
+let SDIO_INT_HOST_MASK  = 0x24
+let I_HMB_SW_MASK       = 0xF0
 // A wrapper's IO control and reset control: FGC, CLOCK_EN; RESET.
-let AI_IOCTRL = 0x408
-let AI_RESETCTRL = 0x800
-let IOCTRL_FGC = 0x02
+let AI_IOCTRL       = 0x408
+let AI_RESETCTRL    = 0x800
+let IOCTRL_FGC      = 0x02
 let IOCTRL_CLOCK_EN = 0x01
 // RAM: 512 KB from 0; the NVRAM's length word is its last.
-let RAM_SIZE = 0x80000
+let RAM_SIZE      = 0x80000
 let WATERMARK_SPI = 0x20
 
 // The CLM download: `clmload`, a 12-byte header (the flags, the type 2,
 // the chunk's length, a CRC of 0), the chunk.  The flags: HANDLER_VER,
 // BEGIN on the first chunk, END on the last.
-let CLM_CHUNK = 1024
+let CLM_CHUNK      = 1024
 let DL_HANDLER_VER = 0x1000
-let DL_BEGIN = 0x0002
-let DL_END = 0x0004
-let DL_TYPE_CLM = 2
+let DL_BEGIN       = 0x0002
+let DL_END         = 0x0004
+let DL_TYPE_CLM    = 2
 
 // Whether `bring_up` has run to its end since the program started.
 var chip_up = false
@@ -153,7 +153,7 @@ struct Cyw43439
 // register `reg` to be set; answers whether they were.
 fn wait_csr(g: Gspi, reg: Int, mask: Int, ms: Int) -> Bool [hw, mutate]
     let t = BoardTimer { id: 0 }
-    for _i in 0..(ms * 10)
+    for _i in 0..ms * 10
         if (g.read(cyw43_gspi.FUNC_BACKPLANE, reg, 1) & mask) == mask
             return true
         t.delay_us(100)
@@ -304,7 +304,7 @@ impl Cyw43439
         let nv_addr = RAM_SIZE - 4 - nv_len
         g.bp_write_str(nv_addr, nv, nv_len, true)
         let words = nv_len / 4
-        let magic = int.shl((~words) & 0xFFFF, 16) | words
+        let magic = int.shl(~words & 0xFFFF, 16) | words
         g.bp_write(RAM_SIZE - 4, magic, 4)
         if g.bp_read(RAM_SIZE - 4, 4) != magic
             // cov: skip — reached only by a chip that fails this step; the bench's chip passes it
@@ -352,7 +352,7 @@ impl Cyw43439
         let n = str.len(clm)
         var r: Cyw43Reply = Vec.new()
         var ok = true
-        for k in 0..((n + CLM_CHUNK - 1) / CLM_CHUNK)
+        for k in 0..(n + CLM_CHUNK - 1) / CLM_CHUNK
             let off = k * CLM_CHUNK
             var len = n - off
             if len > CLM_CHUNK
@@ -392,7 +392,7 @@ impl Cyw43439
             // cov: skip — no credit; see ioctl_begin
             return false
         cyw43_ioctl.put_name(g, name)
-        for _i in 0..(data - str.len(name) - 1)
+        for _i in 0..data - str.len(name) - 1
             g.put(0)
         cyw43_ioctl.ioctl_end(g)
         cyw43_ioctl.ioctl_wait(g, 1000, var out) == 0
@@ -403,7 +403,7 @@ impl Cyw43439
         if r.len() < 4
             // cov: skip — a reply shorter than its value; the bench's firmware answers clmload_status whole
             return -1
-        (r[0] as Int) | int.shl(r[1] as Int, 8) | int.shl(r[2] as Int, 16) | int.shl(r[3] as Int, 24)
+        r[0] as Int | int.shl(r[1] as Int, 8) | int.shl(r[2] as Int, 16) | int.shl(r[3] as Int, 24)
 
     // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // The firmware's version string, the `ver` iovar, into `out`, its
@@ -420,7 +420,7 @@ impl Cyw43439
         for i in 0..n
             if out[n - 1 - i] == 0
                 end = n - 1 - i
-        for _i in 0..(n - end)
+        for _i in 0..n - end
             let _b = out.pop()
         true
 
@@ -432,7 +432,10 @@ impl Cyw43439
             return false
         let g = self.gspi
         let bit = int.shl(1, pin)
-        let level = if on then bit else 0
+        let level = if on
+            bit
+        else
+            0
         if not cyw43_ioctl.ioctl_begin(g, cyw43_ioctl.IOCTL_SET, cyw43_ioctl.CMD_SET_VAR, 8 + 8)
             // cov: skip — no credit; see ioctl_begin
             return false

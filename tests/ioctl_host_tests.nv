@@ -1,0 +1,64 @@
+// ioctl_host_tests.nv: the ioctl path's packing of bytes into words and
+// its bookkeeping, run on the host.
+//
+// On the host a handle's calls reach no peripheral, so the bus reads
+// back zeros and every word sent is dropped; what is left to check is
+// what the driver keeps in its own variables.  A data word of a write
+// is four bytes, the first going out in the low byte, and the word is
+// sent when its fourth byte arrives.  The bring-up, the backplane and
+// the frames a chip answers are run on a board, by the Pico 2 W
+// package's suite.
+
+use std.test
+use cyw43_gspi.{ Gspi }
+use cyw43_ioctl
+use cyw43_gspi
+use embedded_hal.{ BoardSpi, BoardGpio }
+
+fn gspi() -> Gspi
+    Gspi { bus: BoardSpi { id: 0 }, pins: BoardGpio { id: 0 }, cs: 25 }
+
+@test
+fn test_a_16_bit_value_goes_out_low_byte_first() [io, hw, mutate]
+    let g = gspi()
+    g.put_begin(2, 0, 4)
+    cyw43_ioctl.put16(g, 0xBEEF)
+    test.assert_eq(cyw43_gspi.out_count, 2)
+    test.assert_eq(cyw43_gspi.out_word, 0xBEEF)
+    g.put_end()
+    test.assert_eq(cyw43_gspi.out_count, 0)
+
+@test
+fn test_a_32_bit_value_fills_one_word_and_sends_it() [io, hw, mutate]
+    let g = gspi()
+    g.put_begin(2, 0, 4)
+    cyw43_ioctl.put32(g, 0x12345678)
+    test.assert_eq(cyw43_gspi.out_count, 0)
+    test.assert_eq(cyw43_gspi.out_word, 0)
+    g.put_end()
+
+@test
+fn test_a_name_is_its_bytes_and_a_nul() [io, hw, mutate]
+    let g = gspi()
+    g.put_begin(2, 0, 4)
+    cyw43_ioctl.put_name(g, "ver")
+    test.assert_eq(cyw43_gspi.out_count, 0)
+    g.put_end()
+
+@test
+fn test_an_ioctl_takes_a_sequence_number_and_a_fresh_id() [io, hw, mutate]
+    let g = gspi()
+    cyw43_ioctl.ioctl_reset()
+    test.assert(cyw43_ioctl.ioctl_begin(g, 0, 262, 4))
+    cyw43_ioctl.put32(g, 0)
+    cyw43_ioctl.ioctl_end(g)
+    test.assert_eq(cyw43_ioctl.tx_seq, 1)
+    test.assert_eq(cyw43_ioctl.ioctl_id, 1)
+    test.assert_eq(cyw43_ioctl.ioctl_frames_dropped(), 0)
+
+@test
+fn test_no_reply_from_a_silent_chip_is_minus_one() [io, hw, mutate]
+    let g = gspi()
+    cyw43_ioctl.ioctl_reset()
+    var reply: cyw43_ioctl.Cyw43Reply = Vec.new()
+    test.assert_eq(cyw43_ioctl.ioctl_wait(g, 1, var reply), 0 - 1)

@@ -40,32 +40,32 @@
 use embedded_hal.{ BoardSpi, BoardGpio, SpiBus, GpioOut }
 
 // The functions.
-let FUNC_BUS = 0
+let FUNC_BUS       = 0
 let FUNC_BACKPLANE = 1
-let FUNC_WLAN = 2
+let FUNC_WLAN      = 2
 
 // The bus's registers, on function 0.
-let REG_BUS_CTRL = 0x0
-let REG_BUS_INTERRUPT = 0x04
+let REG_BUS_CTRL             = 0x0
+let REG_BUS_INTERRUPT        = 0x04
 let REG_BUS_INTERRUPT_ENABLE = 0x06
-let REG_BUS_STATUS = 0x08
-let REG_BUS_TEST_RO = 0x14
-let REG_BUS_TEST_RW = 0x18
-let REG_BUS_RESP_DELAY_F1 = 0x1D
+let REG_BUS_STATUS           = 0x08
+let REG_BUS_TEST_RO          = 0x14
+let REG_BUS_TEST_RW          = 0x18
+let REG_BUS_RESP_DELAY_F1    = 0x1D
 
 // The backplane's registers, on function 1.
 let REG_BP_FUNCTION2_WATERMARK = 0x10008
-let REG_BP_ADDRESS_LOW = 0x1000A
-let REG_BP_ADDRESS_MID = 0x1000B
-let REG_BP_ADDRESS_HIGH = 0x1000C
-let REG_BP_CHIP_CLOCK_CSR = 0x1000E
-let REG_BP_PULL_UP = 0x1000F
+let REG_BP_ADDRESS_LOW         = 0x1000A
+let REG_BP_ADDRESS_MID         = 0x1000B
+let REG_BP_ADDRESS_HIGH        = 0x1000C
+let REG_BP_CHIP_CLOCK_CSR      = 0x1000E
+let REG_BP_PULL_UP             = 0x1000F
 
 // The window: 32 KB, an address's low 15 bits; bit 15 of a function-1
 // address asks for a 32-bit access.  A transfer moves at most 64 bytes.
-let WINDOW_MASK = 0x7FFF
-let WINDOW_SIZE = 0x8000
-let ADDR_32BIT = 0x8000
+let WINDOW_MASK  = 0x7FFF
+let WINDOW_SIZE  = 0x8000
+let ADDR_32BIT   = 0x8000
 let MAX_TRANSFER = 64
 
 // What READ_TEST_RO answers on a working bus.
@@ -74,9 +74,9 @@ let FEEDBEAD = 0xFEEDBEAD
 // The backplane window last written, -1 when unknown (after power-on),
 // so the first access writes all three bytes of it; the last status
 // word; and the bytes of the data word being written and how many.
-var window = -1
-var status = 0
-var out_word = 0
+var window    = -1
+var status    = 0
+var out_word  = 0
 var out_count = 0
 // The data word being read and how many of its bytes are left.
 var in_word = 0
@@ -85,15 +85,18 @@ var in_left = 0
 var in_words = 0
 
 // A command word.
-@no_alloc
-pub fn cmd_word(write: Bool, func: Int, addr: Int, len: Int) -> Int
-    let w = if write then 0x80000000 else 0
+pub @no_alloc
+fn cmd_word(write: Bool, func: Int, addr: Int, len: Int) -> Int
+    let w = if write
+        0x80000000
+    else
+        0
     w | 0x40000000 | int.shl(func & 3, 28) | int.shl(addr & 0x1FFFF, 11) | (len & 0x7FF)
 
 // A word with its two 16-bit halves swapped, as the bus takes and answers
 // them before it is set to 32-bit words.
-@no_alloc
-pub fn swap16(x: Int) -> Int
+pub @no_alloc
+fn swap16(x: Int) -> Int
     (int.shl(x & 0xFFFF, 16) | int.shr_logical(x, 16)) & 0xFFFFFFFF
 
 // The gSPI on a board: its SPI bus, the board's GPIO and the chip-select
@@ -112,17 +115,14 @@ impl Gspi
         window = -1
         status = 0
 
-    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     fn select(self) [hw]
         self.pins.set(self.cs, 0)
 
-    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // Reads the status word, then raises the chip select.
     fn end(self) [hw, mutate]
         status = self.recv_word()
         self.pins.set(self.cs, 1)
 
-    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // One word, most significant byte first.
     fn send_word(self, w: Int) [hw]
         let _a = self.bus.transfer(int.shr_logical(w, 24) & 0xFF)
@@ -130,7 +130,6 @@ impl Gspi
         let _c = self.bus.transfer(int.shr_logical(w, 8) & 0xFF)
         let _d = self.bus.transfer(w & 0xFF)
 
-    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // One word read, the first byte the most significant.
     fn recv_word(self) -> Int [hw]
         let a = self.bus.transfer(-1)
@@ -204,18 +203,23 @@ impl Gspi
     // address's 32-bit flag.
     fn bp_read(self, addr: Int, len: Int) -> Int [hw, mutate]
         self.set_window(addr)
-        let flag = if len == 4 then ADDR_32BIT else 0
+        let flag = if len == 4
+            ADDR_32BIT
+        else
+            0
         self.read(FUNC_BACKPLANE, (addr & WINDOW_MASK) | flag, len)
 
     // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     fn bp_write(self, addr: Int, val: Int, len: Int) [hw, mutate]
         self.set_window(addr)
-        let flag = if len == 4 then ADDR_32BIT else 0
+        let flag = if len == 4
+            ADDR_32BIT
+        else
+            0
         self.write(FUNC_BACKPLANE, (addr & WINDOW_MASK) | flag, val, len)
 
     // ── Data bytes ──────────────────────────────────────────────────
 
-    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // Starts a write transaction of `len` data bytes to `func` at
     // `addr`; the caller sends them with `put`, then `put_end`.
     fn put_begin(self, func: Int, addr: Int, len: Int) [hw, mutate]
@@ -224,7 +228,6 @@ impl Gspi
         out_word = 0
         out_count = 0
 
-    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // One data byte; every fourth sends the word they make.
     fn put(self, b: Int) [hw, mutate]
         out_word = out_word | int.shl(b & 0xFF, int.shl(out_count, 3))
@@ -234,7 +237,6 @@ impl Gspi
             out_word = 0
             out_count = 0
 
-    // cov: skip — the function drives the board's SPI and GPIO handles, which exist only on a board; the Pico 2 W package's suite runs these lines on the board, and the host suite covers the command word and the half swap that need no handle.
     // Sends a part word padded with zeros, then ends the transaction.
     fn put_end(self) [hw, mutate]
         if out_count > 0
@@ -306,7 +308,7 @@ impl Gspi
         var off = 0
         // A chunk is 64 bytes but where the window ends, which cuts one
         // more chunk per 32 KB at most.
-        for _k in 0..(n / MAX_TRANSFER + n / WINDOW_SIZE + 2)
+        for _k in 0..n / MAX_TRANSFER + n / WINDOW_SIZE + 2
             if off < n
                 let len = self.chunk(at, n - off)
                 self.set_window(at)

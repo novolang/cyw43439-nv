@@ -88,6 +88,13 @@ writes them as the constants of the module `cyw43439_blobs`
 ([the manifest's `[assets]`](../../docs/manifest.md#assets)).  On a
 device they are constant data in the image's flash, about 233 KB.
 
+## Build and test
+
+```bash
+novo pkg build
+novo test
+```
+
 ## Tests
 
 `novo test tests` checks the command words and the blobs on the host.

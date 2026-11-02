@@ -11,6 +11,7 @@
 use std.test
 use cyw43_gspi
 use cyw43439_blobs
+use cyw43_ioctl
 
 @test
 fn test_a_read_of_the_bus_test_register() [io]
@@ -44,3 +45,11 @@ fn test_the_blobs_are_whole() [io]
     test.assert_eq(str.byte_at_or(cyw43439_blobs.firmware, 5, -1), 0x14)
     // The NVRAM starts with its revision line.
     test.assert_eq(str.byte_at_or(cyw43439_blobs.nvram, 0, -1), 78)
+
+@test
+fn test_the_control_path_starts_over_with_credit_and_no_dropped_frames() [io, mutate]
+    cyw43_ioctl.ioctl_reset()
+    test.assert_eq(cyw43_ioctl.ioctl_frames_dropped(), 0)
+    // Out of reset the sequence is 0 and the chip's limit is 1, so one
+    // frame is admitted.
+    test.assert(cyw43_ioctl.has_credit())
