@@ -1,6 +1,6 @@
 [package]
 name        = "cyw43439-nv"
-version     = "0.1.2"
+version     = "0.1.3"
 description = "A driver for Infineon's CYW43439 wireless chip on its gSPI bus: the bus protocol over embedded-hal-nv's SpiBus, the chip's power-on, its firmware, NVRAM and CLM downloads, the ioctl path, and the chip's own GPIO pins, which drive the Pico W boards' LED.  Carries Infineon's firmware blobs under their own licence."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -11,7 +11,7 @@ repository  = "https://github.com/novolang/cyw43439-nv"
 maintainers = ["novo-lang"]
 # The toolchain floor: devices-nv 0.3.0, whose wiring carries the power
 # pin, takes 0.19.3.
-novo        = ">= 0.21.1"
+novo        = ">= 0.23.0"
 
 [dependencies]
 # The board's SPI bus and GPIO handles, and the SpiBus, GpioOut and
